@@ -12,6 +12,7 @@ Before any code, agree on the exact three minutes you will show judges. Everythi
 **Type a target:** "I want to work at Jane Street as a software engineer."
 **Screen shows** 12 current postings ingested, 23 distinct skills extracted, weighted by how many postings mention each.
 **Coverage map:** 9 of 23 skills already satisfied by completed coursework, each with the course that satisfies it. 11 addressable by catalog courses. 3 not teachable here.
+**The plan:** Winter / Spring / Autumn, real course codes, prereq chains respected, each course carrying a posting quote and a catalog quote.
 **The kill shot:** same question to a plain chatbot on the next monitor. It invents CMSC 27500 "Advanced Trading Systems". Search the real catalog live. No such course.
 
 Beat 6 is the pitch. Rehearse it.
@@ -43,7 +44,7 @@ Sleep is in the budget. Two people awake at hour 40 write code that loses hackat
 Lock these before writing code:
 
 - One school. UChicago. One catalog.
-- Three to five target companies, chosen for having many public postings with concrete technical requirements.
+- Three to five target companies, chosen for having many public postings with concrete technical requirements. Pick now; the scrape depends on it.
 - Two sample transcripts. One "on track", one "behind and needs a tight plan".
 - Cloudflare account on **Workers Paid ($5/mo)**. Not optional. Also: `wrangler login`, Anthropic API key, and an AI Gateway created with its ID noted.
 
@@ -51,9 +52,13 @@ Lock these before writing code:
 
 ## Stage 1 [A] — Offline data prep (H2–H10)
 
+This is the critical path and the most underestimated stage. Start it at hour 2.
+
 Scripts live in `/data/scripts` and run locally on Node — they are not deployed.
 
 ### 1a. Catalog → structured JSON
+
+Target output, one object per course:
 
 ```json
 {
@@ -68,60 +73,141 @@ Scripts live in `/data/scripts` and run locally on Node — they are not deploye
 }
 ```
 
+Prereq extraction is an LLM pass, not a regex. Then a human reads the ~200 courses in the departments you will actually demo and fixes what the model got wrong. Budget 90 minutes for this review.
+
 ### 1b. Job postings → structured JSON
 
-Public postings only. No LinkedIn profiles.
+Scrape once, offline, commit the raw HTML to `/data/raw` and parsed JSON to `/data/fixtures/postings/`. Ten to fifteen postings per company. Keep the full text — you need exact spans for evidence citations.
+
+Public postings only. No LinkedIn profiles, no authenticated pages.
 
 ### 1c. Embeddings
 
-Embed every course description with `@cf/baai/bge-base-en-v1.5` (768 dims). Store as Float32 blobs in the seed SQL. One INSERT per course.
+Embed every course description with `@cf/baai/bge-base-en-v1.5` (768 dims) via a local script hitting `POST /client/v4/accounts/{id}/ai/run/@cf/baai/bge-base-en-v1.5`. Store as Float32 blobs in the seed SQL.
 
-**Acceptance:** `catalog.json` >1500 courses, `postings/` ≥10 postings per company, `seed.sql` loads without error.
+Two details that cause silent corruption if missed: pin the pooling mode explicitly, and emit one INSERT per course — D1 caps a SQL statement at 100 KB.
+
+**Acceptance:** `catalog.json` has >1500 courses, >95% with parsed prereqs, and the ~200 demo-department courses are human-verified. `postings/` has ≥10 postings per target company. `seed.sql` loads into a local D1 without error.
+
+**Prompt for Claude Code:** "Write Node scripts in `/data/scripts` that (1) parse the catalog HTML in `/data/raw` into the course JSON schema in PLAN.md stage 1a, using the Anthropic API for prerequisite expression extraction with a validated JSON schema and a retry on malformed output; (2) parse saved job posting HTML into `{company, title, url, full_text, scraped_at}`; (3) call the Workers AI REST embeddings endpoint for every course description and emit `seed.sql` with vectors as hex-encoded Float32 blobs. Include a `--dry-run` flag and print a parse-failure report at the end listing every course whose prereqs failed to parse."
 
 ## Stage 2 [B] — Skeleton, deployed (H2–H6)
 
+In parallel with Stage 1. The goal is a live URL by hour 6.
+
 - `npm create cloudflare@latest -- coursemap --framework=react`
-- `wrangler.jsonc` with assets, D1, and AI bindings
-- `GET /api/health` → `{ok: true, db: <row count>}`
-- `wrangler deploy` — confirm from phone on cell data
+- `wrangler.jsonc` with assets binding, D1, and AI bindings
+- One real endpoint: `GET /api/health` returning `{ok: true, db: <row count>}`
+- `wrangler deploy`. Confirm the URL loads from a phone on cell data.
+
+**Acceptance:** public URL serving the React app and `/api/health` reading from D1.
+
+**Prompt for Claude Code:** "Scaffold a Cloudflare Worker with `@cloudflare/vite-plugin` serving a React SPA from static assets, plus D1 and Workers AI bindings, per the stack table in CLAUDE.md. Add migrations for the schema below, a `/api/health` endpoint that returns a course count from D1, and strict TypeScript. Do not add any dependency not required for this."
 
 ## Stage 3 [B] — Ingest and skill extraction (H6–H14)
 
-Pasted text is the primary transcript path. Skill extraction produces a weighted taxonomy with posting citations.
+**Transcript parsing.** Pasted text is the primary path. PDF upload handles exactly one sample file you control. Do not generalize.
+
+**Skill extraction.** For a target company, pull its postings from D1 and run one LLM pass producing a weighted skill taxonomy:
+
+```json
+[{ "skill": "probability and statistics",
+   "weight": 0.58,
+   "postings": ["jane-street-swe-1", "jane-street-swe-4"],
+   "evidence": ["Strong foundation in probability and statistics"] }]
+```
+
+Weight is fraction of postings mentioning the skill. Merge near-duplicates in the same pass.
+
+**Acceptance:** paste a transcript and a sentence, get back a validated course list and a ranked skill list with posting citations. Endpoint-level, no UI needed yet.
 
 ## Stage 4 — Matching engine (H14–H22)
 
-In `/src/core/match.ts`, pure and unit-tested:
-1. Coverage — which skills already satisfied
-2. Candidates — cosine-rank catalog, top 30 per skill, load table once
-3. Re-rank with Claude — verify every code and quote span against D1
+Three steps, in `/src/core/match.ts`, pure and unit-tested:
+
+1. **Coverage.** Which demanded skills does the transcript already satisfy? Embed each completed course's catalog description, cosine against skill embeddings, threshold.
+2. **Candidates.** For each uncovered skill, cosine-rank all catalog course embeddings, take top 30, drop courses already taken. Load the courses table once per request.
+3. **Re-rank with Claude.** Feed the 30 candidates plus the skill plus the student context. The model returns ordered course codes with quoted spans from catalog text and posting text. Verify every returned code exists in D1 and every quoted span appears verbatim in the source. Drop and log anything that fails.
+
+Mark skills with no candidate above threshold as `not_teachable_here`.
+
+**Acceptance:** unit tests over a fixture transcript produce a stable, verified recommendation set. Every citation span is checked to exist in the source text.
 
 ## Stage 5 — Scheduler (H22–H30)
 
-Greedy topological sort into term-by-term plan. Reserve slots for degree requirements first.
+Turns a ranked course list into a term-by-term plan.
+
+Inputs: recommended courses with skill weights, prereq trees, terms offered, completed courses, remaining terms, max credits per term, outstanding degree requirements.
+
+Greedy with backtracking:
+1. Topologically sort by prereq depth.
+2. Walk terms in order; fill slots with the highest-weight available course whose prereqs are satisfied and which is offered that term.
+3. Reserve slots for unmet degree requirements before discretionary picks.
+4. If a high-value course is unreachable, report it explicitly.
+
+**Acceptance:** the "behind schedule" fixture transcript produces a valid plan with no prereq violation, no course offered in a wrong term, and all degree requirements met.
 
 ## Stage 6 [B] — UI (H26–H38)
 
-Four screens: Input, Coverage map, The plan, Course detail. Tailwind only.
+Four screens. Resist adding a fifth.
+
+1. **Input** — transcript textarea, target sentence, one button.
+2. **Coverage map** — demanded skills, three states: already covered, addressable, not teachable here.
+3. **The plan** — terms as columns, courses as cards, prereq arrows.
+4. **Course detail** — full catalog text, posting quotes, prereq status.
+
+Tailwind, no component library, no animation beyond a loading state. Make the loading state informative ("reading 12 postings… extracting skills… matching 1,847 courses").
 
 ## Stage 7 — Demo hardening (H38–H44)
 
-- Seed LLM cache, verify cache hits
-- Airplane-mode test — stub fetch to throw
-- Record 3-minute screen capture
-- Rehearse twice with a timer
+The highest-value hours in the build. Do not skip them to add a feature.
+
+- Seed the LLM cache. Run the golden path repeatedly, capture every Anthropic response into `llm-cache.json`, seed into D1, verify cache hits.
+- Airplane-mode test. Stub `fetch` to throw. The golden path must still complete end to end.
+- Prepare the kill shot. Get the chatbot hallucinating a fake course code and screenshot it as backup.
+- Record a 3-minute screen capture of the working demo. Insurance against venue wifi.
+- Error states for: unknown company, unparseable transcript, empty catalog match.
+- Rehearse twice, out loud, with a timer. Time it to 2:30 so you have slack.
 
 ## Stage 8 — Pitch (H44–H48)
 
-Five slides. Problem → Demo → Why not chatbot → Who pays → What's next.
+Five slides: Problem → Demo → Why it isn't a chatbot wrapper → Who pays → What's next.
+
+Prepare answers to the two questions you will definitely get:
+
+- **"Isn't this just ChatGPT?"** → Beat 6. Show, don't argue.
+- **"Does this actually get people hired?"** → No, and don't claim it. It closes a documented skill gap against stated employer requirements.
+
+## Optional Stage 9 — Vectorize (only if ahead at H30)
+
+```bash
+npx wrangler vectorize create coursemap --dimensions=768 --metric=cosine
+npx wrangler vectorize create-metadata-index coursemap --property-name=department --type=string
+```
+
+Metadata indexes must run before any vectors are inserted. Keep the brute-force path behind a feature flag.
+
+## Known risks
+
+| Risk | Mitigation |
+|------|-----------|
+| Prereq parsing is worse than expected | Human review of demo departments in Stage 1; structured prereqs committed, never parsed at runtime |
+| Anthropic latency makes the demo drag | Cache seeded in Stage 7; informative loading state |
+| Venue wifi fails | Full offline path, tested with fetch stubbed; recorded video backup |
+| Skill extraction produces mush ("communication", "teamwork") | Prompt for concrete technical/analytical competencies only; drop soft skills with an explicit filter list |
+| Transcript format from a judge's own school breaks it | Scope to one school out loud in the pitch |
+| Workers Free 10 ms CPU limit kills the similarity scan | Workers Paid from hour zero |
+| Embeddings appear to "just be bad" | Almost always wrong BLOB decode or mismatched pooling mode. Check both before blaming the model |
 
 ## Descope ladder
 
-1. PDF upload → paste only
-2. Multiple companies → one company
-3. Degree-requirement checking → skill gaps only
-4. Prereq arrows → text note
-5. Scheduler → ranked list grouped by term
-6. Course detail → expand inline
+When you fall behind — cut in this order:
+
+1. PDF transcript upload → paste only.
+2. Multiple companies → one company, fully polished.
+3. Degree-requirement checking → skill gaps only, note it as future work.
+4. Prereq arrows in the UI → a text note under each course.
+5. The scheduler → a ranked list grouped by suggested term. Cut this only if truly desperate.
+6. Course detail screen → expand inline on the plan screen.
 
 **Never cut:** citation verification, the coverage map, or the offline demo path.
