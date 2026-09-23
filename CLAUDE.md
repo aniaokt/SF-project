@@ -99,43 +99,15 @@ Read these before writing the matching engine. Each one fails in a way that look
 
 ## Things not to do
 
-- Do not build a general-purpose transcript PDF parser. Support pasted text as the primary path, plus exactly one sample PDF we control.
-- Do not scrape LinkedIn profiles. Public job postings only.
-- Do not build auth, accounts, or multi-tenancy. One session, in memory, no login.
-- Do not attempt live catalog ingestion for arbitrary schools. One school, prepared offline.
-- Do not add Durable Objects, Queues, Workflows, or Hyperdrive.
-- Do not spend time on responsive mobile layout.
+- **Do not build a general-purpose transcript PDF parser.** Transcript layouts vary wildly by school and year. Support pasted text as the primary path, plus exactly one sample PDF we control. This is a trap that eats a full day.
+- **Do not scrape LinkedIn profiles.** It violates their terms, it will be asked about by judges, and job postings are a better signal anyway. Public postings only.
+- **Do not build auth, accounts, or multi-tenancy.** One session, in memory, no login.
+- **Do not attempt live catalog ingestion for arbitrary schools.** One school, prepared offline.
+- **Do not add Durable Objects, Queues, Workflows, or Hyperdrive.** Nothing here needs them, and each is a new failure mode.
+- **Do not spend time on responsive mobile layout.** It will be demoed on a laptop or projector.
 
 ## Prerequisite data is the hard part
 
-Handle prereq parsing offline: run an LLM extraction pass over the catalog into a structured prereq expression tree (`{all: [...]}`, `{any: [...]}`, `{consent: true}`), then have a human spot-check the courses in the departments we demo. Commit the result. The Worker reads structured prereqs and never parses prose at runtime.
+Catalog prerequisite text is messy natural language: "CMSC 15400 or equivalent, and consent of instructor", "one of MATH 15300, 15910, or 16300". Parsing this is the single most underestimated task in the build.
 
-## D1 schema
-
-```sql
-CREATE TABLE courses (
-  code TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL,
-  department TEXT, credits REAL, terms TEXT,          -- JSON array
-  prereqs TEXT, fulfills TEXT,                        -- JSON
-  embedding BLOB   -- 768 × float32. Decode as new Float32Array(new Uint8Array(v).buffer)
-);
-CREATE TABLE postings (
-  id TEXT PRIMARY KEY, company TEXT NOT NULL, title TEXT NOT NULL,
-  url TEXT, full_text TEXT NOT NULL, scraped_at TEXT
-);
-CREATE TABLE skills (
-  id TEXT PRIMARY KEY, company TEXT NOT NULL, label TEXT NOT NULL,
-  aliases TEXT, weight REAL NOT NULL, evidence TEXT,  -- JSON: [{posting_id, quote}]
-  embedding BLOB
-);
-CREATE TABLE requirements (
-  id TEXT PRIMARY KEY, program TEXT NOT NULL, label TEXT NOT NULL,
-  rule TEXT NOT NULL                                  -- JSON: {n_of: 3, from: [...]}
-);
-CREATE TABLE llm_cache (
-  key TEXT PRIMARY KEY, response TEXT NOT NULL, created_at TEXT
-);
-CREATE INDEX idx_courses_dept ON courses(department);
-CREATE INDEX idx_postings_company ON postings(company);
-CREATE INDEX idx_skills_company ON skills(company);
-```
+Handle it offline, before the clock matters: run an LLM extraction pass over the catalog into a structured prereq expression tree (`{all: [...]}`, `{any: [...]}`, `{consent: true}`), then have a human spot-check the couple hundred courses in the departments we actually demo. Commit the result. The Worker reads structured prereqs and never parses prose at runtime.
