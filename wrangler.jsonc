@@ -13,8 +13,6 @@
     {
       "binding": "DB",
       "database_name": "coursemap-db",
-      // Replace with the id printed by: npx wrangler d1 create coursemap-db
-      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
   ],
